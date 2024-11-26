@@ -19,8 +19,7 @@ use tokio::sync::RwLock;
 use tracing::{error, info};
 use uuid::Uuid;
 
-pub type ShutdownNotification =
-    dyn FnMut() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync;
+pub type ShutdownNotification = Pin<Box<dyn Future<Output = ()> + Send + Sync + 'static>>;
 
 /// The JobScheduler contains and executes the scheduled jobs.
 pub struct JobsSchedulerLocked {
@@ -33,7 +32,7 @@ pub struct JobsSchedulerLocked {
     pub notification_deleter: Arc<RwLock<NotificationDeleter>>,
     pub notification_runner: Arc<RwLock<NotificationRunner>>,
     pub scheduler: Arc<RwLock<Scheduler>>,
-    pub shutdown_notifier: Option<Arc<RwLock<Box<ShutdownNotification>>>>,
+    pub shutdown_notifier: Arc<RwLock<Option<ShutdownNotification>>>,
 }
 
 impl Clone for JobsSchedulerLocked {
@@ -209,7 +208,7 @@ impl JobsSchedulerLocked {
             notification_deleter: Arc::new(Default::default()),
             notification_runner: Arc::new(Default::default()),
             scheduler: Arc::new(Default::default()),
-            shutdown_notifier: None,
+            shutdown_notifier: Default::default(),
         };
 
         Ok(val)
@@ -249,7 +248,7 @@ impl JobsSchedulerLocked {
             notification_deleter: Arc::new(Default::default()),
             notification_runner: Arc::new(Default::default()),
             scheduler: Arc::new(Default::default()),
-            shutdown_notifier: None,
+            shutdown_notifier: Default::default(),
         };
 
         Ok(val)
@@ -300,6 +299,49 @@ impl JobsSchedulerLocked {
 
         let context = self.context();
         JobDeleter::remove(&context, to_be_removed).await
+    }
+
+    pub async fn is_running(&self, job_id: Uuid) -> Result<bool, JobSchedulerError> {
+        if !self.inited().await {
+            let mut s = self.clone();
+            s.init().await?;
+        }
+
+        let mut metadata = self.context.metadata_storage.write().await;
+        let jm = metadata.get(job_id).await?;
+        match jm {
+            Some(job_metadata) => {
+                if job_metadata.stopped {
+                    return Ok(false);
+                }
+                if job_metadata.ran {
+                    return Ok(true);
+                }
+                Ok(false)
+            }
+            _ => Ok(true),
+        }
+    }
+
+    pub(crate) async fn set_ran(&self, job_id: Uuid, ran: bool) -> Result<(), JobSchedulerError> {
+        if !self.inited().await {
+            let mut s = self.clone();
+            s.init().await?;
+        }
+
+        let mut metadata = self.context.metadata_storage.write().await;
+        let jm = metadata.get(job_id).await?;
+        match jm {
+            Some(mut job_metadata) => {
+                job_metadata
+                    .last_updated
+                    .replace(Utc::now().timestamp() as u64);
+                job_metadata.ran = ran;
+                metadata.add_or_update(job_metadata).await?;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// The `start` spawns a Tokio task where it loops. Every 500ms it
@@ -381,15 +423,11 @@ impl JobsSchedulerLocked {
     ///
     /// Shut the scheduler down
     pub async fn shutdown(&mut self) -> Result<(), JobSchedulerError> {
-        let mut notify = None;
-        std::mem::swap(&mut self.shutdown_notifier, &mut notify);
-
         let mut scheduler = self.scheduler.write().await;
         scheduler.shutdown().await;
-
+        let notify = { self.shutdown_notifier.write().await.take() };
         if let Some(notify) = notify {
-            let mut notify = notify.write().await;
-            notify().await;
+            notify.await;
         }
         Ok(())
     }
@@ -428,14 +466,17 @@ impl JobsSchedulerLocked {
 
     ///
     /// Code that is run after the shutdown was run
-    pub fn set_shutdown_handler(&mut self, job: Box<ShutdownNotification>) {
-        self.shutdown_notifier = Some(Arc::new(RwLock::new(job)));
+    pub async fn set_shutdown_handler(
+        &mut self,
+        job: impl Future<Output = ()> + Send + Sync + 'static,
+    ) {
+        self.shutdown_notifier.write().await.replace(Box::pin(job));
     }
 
     ///
     /// Remove the shutdown handler
-    pub fn remove_shutdown_handler(&mut self) {
-        self.shutdown_notifier = None;
+    pub async fn remove_shutdown_handler(&mut self) {
+        self.shutdown_notifier.write().await.take();
     }
 
     ///

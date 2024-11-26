@@ -36,6 +36,7 @@ pub enum JobSchedulerError {
     NatsCouldNotConnect(String),
     #[cfg(feature = "nats_storage")]
     NatsCouldNotCreateKvStore(String),
+    DurationNotSet,
 }
 
 impl Display for JobSchedulerError {
